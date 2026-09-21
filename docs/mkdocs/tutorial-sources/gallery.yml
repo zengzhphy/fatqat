@@ -28,6 +28,7 @@ category_order:
   - foundations
   - algorithms
   - neutral-atom-physics
+  - quantum-error-correction
   - power-systems
 
 categories:
@@ -55,3 +56,9 @@ categories:
       description: >-
         Apply the QUBO and QAOA machinery to grid operation problems, where the
         encoding decides whether a network fits on the device at all.
+  quantum-error-correction:
+    en:
+      title: Quantum error correction
+      description: >-
+        Build repeated stabilizer measurements, interpret detection events, and
+        decode logical memories under local circuit noise.
