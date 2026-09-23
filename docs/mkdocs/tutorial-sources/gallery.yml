@@ -28,8 +28,8 @@ category_order:
   - foundations
   - algorithms
   - neutral-atom-physics
-  - quantum-error-correction
   - power-systems
+  - quantum-error-correction
 
 categories:
   foundations:
