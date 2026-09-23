@@ -17,7 +17,9 @@ $+1$, but is not the fully encoded logical state $|0_L\rangle$.
 
 The experiment includes repeated noisy measurements of both stabilizer
 types and a final Z-basis measurement of all nine data
-qubits. Their parity on the logical Z support gives one logical readout bit
+qubits. Each cycle includes a 600 ns ancilla measurement, during which the
+data qubits idle, followed by an instantaneous, error-free ancilla reset.
+The parity of the final data bits on the logical Z support gives one logical readout bit
 per shot. A classical decoder uses the Z-check syndrome history, including
 the final checks reconstructed from data readout, to predict whether that
 logical bit should be flipped. We compare `logical_error_raw` and
@@ -116,7 +118,7 @@ ancillas in $|0\rangle$. The initial Z-check parities and logical Z parity
 are zero. No separate encoding circuit or conditional Z correction precedes
 the QEC cycles.
 
-Even without noise, the first X-check outcomes are random, while the Z checks and logical Z retain eigenvalue +1. In the ideal circuit these checks commute with the Z checks and $Z_L$, so
+In the ideal circuit X checks commute with the Z checks and $Z_L$, so
 they preserve the initial logical Z value. This experiment tracks that
 value without requiring all X-check signs to be $+1$.
 
@@ -136,34 +138,34 @@ print("Four independent checks of each type; code distance 3")
 print("Initial data: |0>^9; initial Z checks and logical Z have eigenvalue +1")
 ```
 
-## 2. Configure local circuit noise
+## 2. Construct the backend and noise model
 
-The QEC17 calibration snapshot contains separate values for 17 qubits and
+The calibration snapshot contains separate values for 17 qubits and
 24 coupled pairs. Here we use the arithmetic mean over qubits for the
-single-qubit fidelity, T1, echo T2, F00, and F11, and the arithmetic mean over
+single-qubit fidelity, $T_1$, echo $T_2$, $F_{00}$, and $F_{11}$, and the arithmetic mean over
 coupled pairs for CZ fidelity. Every qubit therefore shares the same
-single-qubit, idle, and readout parameters, and every CZ shares the same
-two-qubit parameter. This model does not retain variation between sites.
-For relaxation, we average T1 and T2 first and then construct the channels;
-this is not the same as averaging the individual relaxation channels.
+single-qubit, idle, and readout parameters, and every CZ shares the same fidelity.
 
-We interpret each supplied gate fidelity as an average gate fidelity
-$F_{\rm avg}$. Here "average gate fidelity" means the fidelity averaged over
-input states; it is distinct from taking the device-wide arithmetic means
-above. FatQat uses the depolarizing convention
+
+Here we use a $d$-dimensional depolarizing channel
 
 $$
-\mathcal E(\rho)=(1-p)\rho+pI/d,\qquad
+\mathcal E(\rho)=(1-p)\rho+pI/d,
+$$
+
+given gate fidelity $F_{\rm avg}$, we obtain
+
+$$
 p=\frac{d}{d-1}(1-F_{\rm avg}).
 $$
 
 Each X or SX receives one single-qubit channel, and each CZ receives one
-joint two-qubit channel. RZ is virtual and noiseless. Gate-time relaxation
-is not added on top of these calibrated gate errors. Spectators receive
-explicit identities carrying amplitude damping and pure dephasing: one
-20 ns tick during a single-qubit layer, and two ticks during a CZ layer.
-The residual pure-dephasing rate is $1/T_2-1/(2T_1)$, so T1's contribution
-to coherence loss is counted once.
+joint two-qubit channel. RZ is virtual and noiseless. During each gate layer, idle qubits undergo amplitude damping and pure dephasing for the duration of that layer, which is 20 ns for a single-qubit gate layer and 40 ns for a CZ layer. These idle intervals are represented by identity operations with the corresponding noise channels.
+All nine data qubits also undergo 600 ns of idle decoherence during each
+ancilla measurement. We represent this interval by 30 consecutive 20 ns
+idle channels on each data qubit. Composing these Markovian channels gives
+the same relaxation and dephasing as one 600 ns interval.
+
 
 ```python
 from fatqat.implementation import default_matrix_implementation_map
@@ -177,6 +179,9 @@ F00 = 0.995764705882353
 F11 = 0.9794705882352941
 IDLE_SECONDS = 20e-9
 CZ_IDLE_TICKS = 2
+MEASUREMENT_SECONDS = 600e-9
+MEASUREMENT_IDLE_TICKS = round(MEASUREMENT_SECONDS / IDLE_SECONDS)
+assert math.isclose(MEASUREMENT_IDLE_TICKS * IDLE_SECONDS, MEASUREMENT_SECONDS)
 
 
 def make_qec17_noise_model():
@@ -233,31 +238,21 @@ def make_qec17_backend(*, noisy=True):
     )
 ```
 
-Readout confusion uses columns for true outcomes and rows for reported
-digits. It changes the classical record, while the measured ancilla remains
-in its true collapsed state. Gate and idle noise act during the QEC cycles;
-readout noise affects both ancilla measurements and the final data readout.
-
-The model assumes uniform mean calibrations, the same fidelity for X and SX,
-and Markovian idle relaxation described by the supplied echo T2. Measurement
-takes zero time here. Leakage, crosstalk,
-measurement-window decoherence, and dynamical decoupling are not included.
-Initialization is ideal: no additional state-preparation error is applied
-to the default all-zero state. These assumptions should be revisited before
-a quantitative comparison with a processor.
+The model uses device-averaged calibration parameters, applied uniformly across qubits and coupled pairs. The X and SX gates are assigned the same gate fidelity, while virtual RZ gates are noiseless. Idle decoherence is modeled as Markovian amplitude damping and pure dephasing, with rates derived from $T_1$ and $T_2^{\mathrm{echo}}$.
+Ancilla measurement takes 600 ns and retains the calibrated readout errors.
+Reset prepares every ancilla in $|0\rangle$ with zero duration and no error,
+independently of its reported measurement bit. The measurement window adds
+decoherence only to the data qubits. Additional ancilla measurement dynamics,
+leakage, crosstalk, and dynamical decoupling are not included.
+Initialization is ideal, so no additional state-preparation error is applied
+to the default all-zero state.
 
 ## 3. Build the memory-Z circuit
 
-For a Z check, data qubits control CNOTs targeting the ancilla. For an X
-check, Hadamards surround the sequence in which the ancilla controls its
-data targets. CNOTs are implemented as $H_t\,CZ_{c,t}\,H_t$. In time order,
-`RZ(pi/2), SX, RZ(pi/2)` equals a Hadamard up to a global phase.
+Z-type stabilizers are measured using CNOT gates with the data qubits as controls and the ancilla as the target. For X-type stabilizers, the ancilla acts as the control and the data qubits as targets. A Hadamard gate is applied to each X-check ancilla before and after its CNOT sequence. All ancillas are then measured in the Z basis.
 
-The four layers visit Z-check corners in northwest, northeast, southwest,
-southeast order, and X-check corners in northwest, southwest, northeast,
-southeast order. Each complete layer has six disjoint couplings. This
-ordering also controls the direction of propagated two-data-qubit hook
-errors; the four-layer schedule must be preserved when changing the circuit.
+
+The CNOT gates are scheduled in four layers. Each Z-check ancilla interacts with its neighbouring data qubits in the order northwest, northeast, southwest, southeast. Each X-check ancilla uses the order northwest, southwest, northeast, southeast. These directions refer to the positions of data qubits relative to the ancilla in the patch diagram. Missing neighbours at the boundaries are skipped. Each layer contains six CNOT gates acting on disjoint qubit pairs. The ordering controls how ancilla faults propagate into correlated data errors. Any alternative schedule should be checked for correct stabilizer extraction and hook-error propagation.
 See [Tomita and Svore](https://arxiv.org/abs/1404.3747).
 
 ```python
@@ -309,19 +304,26 @@ def cx_layer(program, pairs):
     h_layer(program, (target for _, target in pairs))
 ```
 
-Each cycle measures all eight checks and reuses the measured ancillas
-**without reset**. Their initial state is zero, so the no-reset measurement
-history starts with raw reference zero. After the last cycle, measure all
-nine data qubits in the Z basis.
+Each QEC cycle measures all eight ancillas in parallel over a 600 ns window,
+then resets them to $|0\rangle$. The circuit places the ancilla projection
+before the data-only idle channels, which commute with that projection.
+The reset is unconditional and leaves the recorded measurement bits intact.
+The last cycle includes the same measurement window and reset before the
+final Z-basis data readout. No further storage interval is added after that
+terminal readout.
 
 ```python
 def append_memory_round(program, outputs):
-    """Measure all eight checks once and preserve the measured ancilla states."""
+    """Extract checks, idle data for the 600 ns readout, then reset ancillas."""
     h_layer(program, X_CHECKS)
     for layer in CX_LAYERS:
         cx_layer(program, layer)
     h_layer(program, X_CHECKS)
     program.measure(ANCILLAS, tuple(outputs))
+    for _ in range(MEASUREMENT_IDLE_TICKS):
+        for qubit in DATA:
+            program.add(ops.I, qubit)
+    program.add(ops.Reset, ANCILLAS)
 
 
 def build_memory_z(rounds):
@@ -329,6 +331,7 @@ def build_memory_z(rounds):
 
     Records contain 8*R check bits followed by nine data bits.
     The simulator initializes data and ancillas to zero for every shot.
+    Each cycle includes 600 ns of data idling and an ideal ancilla reset.
     """
     if type(rounds) is not int or rounds < 0:
         raise ValueError("rounds must be a nonnegative integer")
@@ -343,38 +346,39 @@ def build_memory_z(rounds):
 for index, layer in enumerate(CX_LAYERS):
     print(f"CX layer {index}: {layer}")
 print("Classical record: eight check bits per QEC cycle, then nine data bits")
+print("Each cycle: 600 ns ancilla readout with data idling, then ideal reset")
 ```
 
 ## 4. Build detection events including the final readout
 
-For an ideal no-reset check, true ancilla outcomes satisfy
-$a_t=a_{t-1}\oplus s_t$, where $s_t$ is its stabilizer bit. A reported bit
-$m_t=a_t\oplus e_t$ may contain a classical readout error. From the R storage
-cycles, indexed $t=0,\ldots,R-1$, infer
+With every ancilla initialized or reset to $|0\rangle$ before extraction,
+an ideal measurement directly returns the stabilizer bit $s_t$.
+A reported bit $m_t=s_t\oplus e_t$ may contain a classical readout error.
+For the R storage cycles, indexed $t=0,\ldots,R-1$, define
 
 $$
-\hat s_t=m_t\oplus m_{t-1},\qquad
-d_0=\hat s_0,\qquad d_t=\hat s_t\oplus\hat s_{t-1}\quad(1\le t<R).
+d_0=m_0,\qquad d_t=m_t\oplus m_{t-1}\quad(1\le t<R).
 $$
 
-Take $m_{-1}=0$ because all ancillas start in $|0\rangle$.
-The initial data have all-positive Z-check signs. For internal
-times, $d_t=m_t\oplus m_{t-2}$, with the initial convention above. A pure
-classical readout flip can therefore trigger events two cycles apart.
-An ancilla quantum fault need not have that signature; see
-[Geher et al.](https://www.nature.com/articles/s41534-025-00998-y).
+The initial data have all-positive Z-check signs, so their reference bits
+are zero. A single classical ancilla-readout flip produces events at two
+adjacent times, t and t+1. For the last ancilla readout, the second event
+lies on the final data boundary. Reset prevents a previous ancilla state
+from carrying over into the next extraction cycle.
 
 The final reported data bits $b$ provide four additional Z-check parities,
 $s_{\mathrm{data}}=H_Zb\pmod2$. Close the detector history with
 
 $$
-d_R=s_{\mathrm{data}}\oplus\hat s_{R-1}.
+d_R=s_{\mathrm{data}}\oplus m_{R-1}.
 $$
 
 The resulting Z-detector array has shape `(R + 1, 4)`. For R=0, it consists
 only of $H_Zb$. These checks come from the actual noisy data readout, not
 from an ideal terminal measurement or access to the quantum state. A final
 Z-basis readout does not supply terminal X-check values.
+Data errors during the last 600 ns measurement window can therefore appear
+on this terminal boundary even when the last ancilla outcomes were correct.
 
 ```python
 def binary_array(values, *, name):
@@ -389,9 +393,9 @@ def detection_events(raw, final_data):
     """Return (R+1, 4) Z detectors, including the measured data boundary.
 
     Raw has shape (R, 4), including (0, 4) when there are no storage rounds.
-    All ancillas start in |0>; the initial physical-zero data have
+    All ancillas start each extraction in |0>. The physical-zero data have
     Z-check signs +1. Only the Z-check history is used here.
-    No ancilla reset occurs between storage rounds.
+    With reset, raw measurements directly report stabilizer bits.
     """
     raw = binary_array(raw, name="raw")
     final_data = binary_array(final_data, name="final_data")
@@ -402,12 +406,10 @@ def detection_events(raw, final_data):
     final_checks = (HZ @ final_data) % 2
     if len(raw) == 0:
         return final_checks[None, :]
-    syndrome = raw.copy()
-    syndrome[1:] ^= raw[:-1]
     detectors = np.empty((len(raw) + 1, 4), dtype=np.uint8)
-    detectors[0] = syndrome[0]
-    detectors[1:-1] = syndrome[1:] ^ syndrome[:-1]
-    detectors[-1] = final_checks ^ syndrome[-1]
+    detectors[0] = raw[0]
+    detectors[1:-1] = raw[1:] ^ raw[:-1]
+    detectors[-1] = final_checks ^ raw[-1]
     return detectors
 
 
@@ -438,7 +440,9 @@ ancilla-readout flips. There are R+1 data-fault layers, including the gap
 after the last QEC cycle. A final data-readout flip has the same detector
 and logical effect as a data X fault in that last gap, so they share one
 effective graph edge. It is not counted twice. An ancilla-readout flip at
-time t joins detectors at t and `min(t + 2, R)` on the same check.
+time t joins detectors at t and t+1 on the same check. Data errors during
+an ancilla measurement window belong to the gap after that extraction,
+including the final gap before data readout.
 
 All single-detector edges terminate at spatial code boundaries. There is
 no open final time boundary: final reported data close the time direction.
@@ -468,13 +472,13 @@ class Fault:
 
 
 def fault_graph(rounds, data_error=0.01, readout_error=0.01):
-    """Build spatial data edges and no-reset ancilla-readout edges.
+    """Build spatial data edges and adjacent-time ancilla-readout edges.
 
     Data X faults occur at R+1 gaps, from before the first storage round to
     after the last one. Final data-readout flips share the last spatial layer
     with late data X faults; they must not be counted again as separate edges.
     The last layer represents an effective proxy error rate for both causes.
-    A raw-readout fault connects t and min(t+2, R), with no data correction.
+    A raw-readout fault connects t and t+1, with no data correction.
     All one-detector edges terminate at spatial boundaries; time is closed
     by the actual terminal data measurement. R=0 is a purely spatial graph.
     """
@@ -495,7 +499,7 @@ def fault_graph(rounds, data_error=0.01, readout_error=0.01):
             ))
     for time in range(rounds):
         for check in range(4):
-            endpoints = (4 * time + check, 4 * min(time + 2, rounds) + check)
+            endpoints = (4 * time + check, 4 * (time + 1) + check)
             faults.append(Fault(("readout", time, check), endpoints, 0, readout_weight))
     return tuple(faults)
 
