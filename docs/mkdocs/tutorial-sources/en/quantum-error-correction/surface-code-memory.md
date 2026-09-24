@@ -247,7 +247,7 @@ leakage, crosstalk, and dynamical decoupling are not included.
 Initialization is ideal, so no additional state-preparation error is applied
 to the default all-zero state.
 
-## 3. Build the memory-Z circuit
+## 3. Build the syndrome extraction circuit
 
 Z-type stabilizers are measured using CNOT gates with the data qubits as controls and the ancilla as the target. For X-type stabilizers, the ancilla acts as the control and the data qubits as targets. A Hadamard gate is applied to each X-check ancilla before and after its CNOT sequence. All ancillas are then measured in the Z basis.
 
@@ -346,10 +346,10 @@ def build_memory_z(rounds):
 for index, layer in enumerate(CX_LAYERS):
     print(f"CX layer {index}: {layer}")
 print("Classical record: eight check bits per QEC cycle, then nine data bits")
-print("Each cycle: 600 ns ancilla readout with data idling, then ideal reset")
+print("Each cycle: 600 ns ancilla readout with data qubit idling, then ideal reset")
 ```
 
-## 4. Build detection events including the final readout
+## 4. Construct detection events including the final readout
 
 With every ancilla initialized or reset to $|0\rangle$ before extraction,
 an ideal measurement directly returns the stabilizer bit $s_t$.
