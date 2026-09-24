@@ -1,11 +1,11 @@
 ---
 title: "Run a surface-code memory-Z experiment"
-description: "Start from nine physical zero states on a noisy 17-qubit superconducting simulator and compare raw and corrected logical-Z error rates after 2, 3, and 5 QEC cycles."
+description: "Run a noisy 17-qubit surface-code memory-Z experiment and fit the decoded logical error per cycle from 128 shots at 3, 6, 9, 12, and 15 QEC cycles."
 icon: material-shield-check-outline
 figure_alts:
   - "Seventeen-qubit surface-code patch with nine data qubits, four X checks, four Z checks, and the logical Z support"
-  - "Z-check detection-event frequencies during five noisy QEC cycles and the final data readout"
-  - "Raw and corrected logical Z error rates versus QEC cycles, with 128 shots per point and 95 percent Wilson intervals"
+  - "Z-check detection-event frequencies during fifteen noisy QEC cycles and the final data readout"
+  - "Decoded logical error versus QEC cycles, with 128 shots per point, 95 percent Wilson intervals, and a fitted logical error probability per cycle"
 ---
 
 # Run a surface-code memory-Z experiment
@@ -22,8 +22,9 @@ data qubits idle, followed by an instantaneous, error-free ancilla reset.
 The parity of the final data bits on the logical Z support gives one logical readout bit
 per shot. A classical decoder uses the Z-check syndrome history, including
 the final checks reconstructed from data readout, to predict whether that
-logical bit should be flipped. We compare `logical_error_raw` and
-`logical_error_corrected` using 128 shots each at 2, 3, and 5 QEC cycles.
+logical bit should be flipped. We report the decoded failure probability as
+**logical error**, using 128 shots each at 3, 6, 9, 12, and 15 QEC cycles,
+and fit an effective logical error probability per cycle.
 
 This is a gate-level study using 9 data qubits and 8 ancillas.
 The simulator's coupling graph and noise parameters are based on calibration
@@ -41,7 +42,6 @@ four ordered CNOT layers in `cx_layers()` below.
 
 ```python
 import math
-from functools import lru_cache
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -446,19 +446,43 @@ including the final gap before data readout.
 
 All single-detector edges terminate at spatial code boundaries. There is
 no open final time boundary: final reported data close the time direction.
-Shortest paths give the costs and masks between pairs of events and to
-spatial boundaries. A small subset search compares pairing events against
-terminating them independently at a boundary.
+The decoder finds a minimum-weight error history consistent with every
+detection event. It only needs the accumulated data-X mask to predict the
+logical correction.
 
 Use $w=\log[(1-p)/p]$ with equal proxy probabilities
 `data_error=readout_error=0.01`. These weights form a minimum-fault-count
 heuristic, not calibrated circuit-level fault probabilities. The decoder
-does not model every correlated gate fault; its subset
-search is intended for short distance-three histories.
+does not model every correlated gate fault.
+
+To handle longer histories, solve this model one time layer at a time.
+Let $e_{t-1}$ and $e_t$ be four-bit masks for adjacent ancilla-readout
+errors, and let $x_t$ be the nine-bit data-X mask in the current gap. They
+must satisfy
+
+$$
+H_Zx_t=d_t\oplus e_{t-1}\oplus e_t.
+$$
+
+There are only 16 possible readout masks. First enumerate all 512 data-X
+masks and retain a minimum-cost mask for each of the 16 Z syndromes. Write
+that cost as $g(s)$. Dynamic programming then minimizes
+
+$$
+V_t(e_t)=w_{\mathrm{readout}}|e_t|+
+\min_{e_{t-1}}\left[V_{t-1}(e_{t-1})+
+g(d_t\oplus e_{t-1}\oplus e_t)\right],
+$$
+
+where $|e_t|$ counts flipped readout bits. Initially only $e_{-1}=0$ is
+allowed. On the final layer require $e_R=0$, because final data-readout
+errors are already included in $x_R$. This boundary condition does not make
+the final measurement noiseless. Along each selected history, XOR the data
+masks to obtain the recovery mask. The work per shot grows linearly with
+the number of cycles for these four checks.
 
 ```python
 from dataclasses import dataclass
-from scipy.sparse.csgraph import shortest_path
 
 
 @dataclass(frozen=True)
@@ -505,99 +529,63 @@ def fault_graph(rounds, data_error=0.01, readout_error=0.01):
 
 
 class SpaceTimeDecoder:
-    """Minimum-weight X recovery using Z detectors and spatial boundaries.
+    """Minimum-weight X recovery with sixteen readout states per time layer.
 
     The return value is a nine-bit X mask. Only its overlap parity with
     LOGICAL_Z is needed to correct the final logical-Z readout. No observed
-    logical bit or statevector is used to select that mask. Equal-cost choices
-    use fixed index order, with boundary matching before an equal-cost pair.
+    logical bit or statevector is used to select that mask. For each spatial
+    syndrome, ties choose the lowest data-mask integer. Equal-cost time-layer
+    transitions choose the lowest incoming readout-state index.
     """
 
     def __init__(self, rounds, data_error=0.01, readout_error=0.01):
         self.rounds = rounds
         self.faults = fault_graph(rounds, data_error, readout_error)
         self.num_detectors = 4 * (rounds + 1)
-        size = self.num_detectors
-        graph = np.full((size, size), np.inf)
-        np.fill_diagonal(graph, 0.0)
-        edge_mask = np.zeros((size, size), dtype=np.uint16)
-        boundary_cost = np.full(size, np.inf)
-        boundary_mask = np.zeros(size, dtype=np.uint16)
-        for fault in self.faults:
-            first = fault.detectors[0]
-            if len(fault.detectors) == 1:
-                proposed = (fault.weight, fault.correction_mask)
-                current = (boundary_cost[first], boundary_mask[first])
-                if proposed < current:
-                    boundary_cost[first] = fault.weight
-                    boundary_mask[first] = fault.correction_mask
-            else:
-                second = fault.detectors[1]
-                proposed = (fault.weight, fault.correction_mask)
-                current = (graph[first, second], edge_mask[first, second])
-                if proposed < current:
-                    graph[first, second] = graph[second, first] = fault.weight
-                    edge_mask[first, second] = edge_mask[second, first] = fault.correction_mask
+        data_weight = float(np.log((1 - data_error) / data_error))
+        readout_weight = float(np.log((1 - readout_error) / readout_error))
+        self.syndrome_bits = 1 << np.arange(4)
+        self.data_cost = np.full(16, np.inf)
+        self.data_mask = np.zeros(16, dtype=np.uint16)
+        for mask in range(512):
+            bits = np.array([(mask >> q) & 1 for q in DATA], dtype=np.uint8)
+            syndrome = int(((HZ @ bits) % 2) @ self.syndrome_bits)
+            cost = mask.bit_count() * data_weight
+            if cost < self.data_cost[syndrome]:
+                self.data_cost[syndrome] = cost
+                self.data_mask[syndrome] = mask
+        self.states = np.arange(16, dtype=np.uint8)
+        self.readout_cost = np.array([
+            mask.bit_count() * readout_weight for mask in range(16)
+        ])
 
-        # Do not let detector-pair paths take shortcuts through a shared
-        # boundary vertex. Each unmatched event terminates independently.
-        self.pair_cost, previous = shortest_path(
-            graph, directed=False, return_predecessors=True
-        )
-        self.pair_mask = np.zeros((size, size), dtype=np.uint16)
-        for source in range(size):
-            for target in range(size):
-                node = target
-                while node != source and previous[source, node] >= 0:
-                    predecessor = int(previous[source, node])
-                    self.pair_mask[source, target] ^= edge_mask[predecessor, node]
-                    node = predecessor
-        destinations = np.argmin(self.pair_cost + boundary_cost[None, :], axis=1)
-        self.boundary_cost = (
-            self.pair_cost[np.arange(size), destinations] + boundary_cost[destinations]
-        )
-        self.boundary_mask = (
-            self.pair_mask[np.arange(size), destinations] ^ boundary_mask[destinations]
-        )
-        if not np.all(np.isfinite(self.boundary_cost)):
-            raise ValueError("every detector must be connected to a boundary")
-
-    @lru_cache(maxsize=None)
-    def _match(self, active):
-        if active == 0:
-            return 0.0, 0
-        first_bit = active & -active
-        first = first_bit.bit_length() - 1
-        rest = active ^ first_bit
-        cost, mask = self._match(rest)
-        best = (cost + self.boundary_cost[first], mask ^ int(self.boundary_mask[first]))
-        candidates = rest
-        while candidates:
-            second_bit = candidates & -candidates
-            second = second_bit.bit_length() - 1
-            cost, mask = self._match(rest ^ second_bit)
-            candidate = (
-                cost + self.pair_cost[first, second],
-                mask ^ int(self.pair_mask[first, second]),
-            )
-            if candidate[0] < best[0]:
-                best = candidate
-            candidates ^= second_bit
-        return best
-
-    def _active(self, detectors):
+    def _solve(self, detectors):
         detectors = binary_array(detectors, name="detectors")
         if detectors.shape != (self.rounds + 1, 4):
             raise ValueError("detectors must have shape (rounds + 1, 4)")
-        return sum(1 << int(node) for node in np.flatnonzero(detectors))
+        costs = np.full(16, np.inf)
+        masks = np.zeros(16, dtype=np.uint16)
+        costs[0] = 0.0
+        for time, detector_bits in enumerate(detectors):
+            current = int(detector_bits @ self.syndrome_bits)
+            outgoing = self.states if time < self.rounds else self.states[:1]
+            syndromes = current ^ self.states[:, None] ^ outgoing[None, :]
+            candidates = (costs[:, None] + self.data_cost[syndromes]
+                          + self.readout_cost[outgoing][None, :])
+            incoming = np.argmin(candidates, axis=0)
+            columns = np.arange(len(outgoing))
+            costs = candidates[incoming, columns]
+            masks = (masks[incoming]
+                     ^ self.data_mask[syndromes[incoming, columns]])
+        return float(costs[0]), int(masks[0])
 
     def decode(self, detectors):
         """Return a nine-bit X mask, using only measured detection events."""
-        return self._match(self._active(detectors))[1]
+        return self._solve(detectors)[1]
 
     def minimum_cost(self, detectors):
         """Return the selected graph cost, useful for independent checks."""
-        return self._match(self._active(detectors))[0]
+        return self._solve(detectors)[0]
 ```
 
 The decoder sees only detection events. In particular, the measured logical
@@ -605,7 +593,7 @@ bit is not an input to `decode()`. Different final data strings can have
 the same Z-check parities but opposite logical parities; the decoder must
 make the same prediction for such identical syndrome histories.
 
-## 6. Count raw and corrected logical errors
+## 6. Measure logical error after decoding
 
 Each shot ends with nine reported data bits $b_0,\ldots,b_8$. The measured
 logical observable is $Z_L=(-1)^\ell$, where
@@ -619,40 +607,39 @@ $|0\rangle^{\otimes9}$ has $Z_L=+1$.
 The decoder receives only Z-check detection events and predicts an X mask
 $x(d)$. Its predicted logical flip is
 $\hat\ell(d)=x_0(d)\oplus x_3(d)\oplus x_6(d)$. It does not use the measured
-logical bit to choose this prediction. Define the two rates, stored as
-`logical_error_raw` and `logical_error_corrected`, respectively:
+logical bit to choose this prediction. The reported logical error is the
+fraction of shots whose decoded logical bit differs from the expected zero:
 
 $$
-\begin{aligned}
-p_{\mathrm{raw}}(R)
-&=\frac1N\sum_{k=1}^N\mathbf1[\ell_k\ne0],\\
-p_{\mathrm{corrected}}(R)
-&=\frac1N\sum_{k=1}^N\mathbf1[\ell_k\oplus\hat\ell(d_k)\ne0],
-\qquad N=128.
-\end{aligned}
+p_L(R)=\frac1N\sum_{k=1}^N
+\mathbf1[\ell_k\oplus\hat\ell(d_k)\ne0],\qquad N=128.
 $$
 
-The corrected indicator is one exactly when the decoder's predicted flip
+The failure indicator is one exactly when the decoder's predicted flip
 disagrees with the observed logical error. We apply this correction to the
 classical interpretation of the measurement; no extra physical recovery
-pulses are simulated. Both curves use the same shots and the same circuit.
-"Raw" means before history-based decoding. Both curves include the same
-stabilizer measurements during storage; neither applies physical correction
-gates. The corrected result updates only the classical interpretation.
+pulses are simulated. The value stored as `logical_error` is the
+decoder-corrected error probability.
 
 ```python
+from time import perf_counter
+
+
 def logical_flip(correction_mask):
     """Return the logical-Z sign flip predicted by a data-X correction mask."""
     return sum((int(correction_mask) >> q) & 1 for q in LOGICAL_Z) % 2
 
 
-RUN_CONFIG = {"shot_parallelism": "serial", "kernel_parallelism": "serial"}
+RUN_CONFIG = {"shot_parallelism": "threads", "kernel_parallelism": "serial",
+              "max_workers": 4}
 SHOTS = 128
-QEC_CYCLES = (2, 3, 5)
+QEC_CYCLES = (3, 6, 9, 12, 15)
 noisy_backend = make_qec17_backend()
 summaries = []
+experiment_started = perf_counter()
 for cycles in QEC_CYCLES:
     decoder = SpaceTimeDecoder(cycles)
+    sampling_started = perf_counter()
     seed = int(np.random.SeedSequence([20260912, cycles]).generate_state(1)[0])
     result = noisy_backend.run(
         build_memory_z(cycles), shots=SHOTS,
@@ -661,41 +648,48 @@ for cycles in QEC_CYCLES:
     ).result()
     counts = result.get_counts_as_tuples()
     assert sum(counts.values()) == SHOTS
-    raw_errors = corrected_errors = 0
+    sampling_seconds = perf_counter() - sampling_started
+    decoding_started = perf_counter()
+    logical_errors = 0
     event_totals = np.zeros((cycles + 1, 4))
     for record, frequency in counts.items():
         detectors, measured_logical = unpack_record(record, cycles)
         # Prediction uses syndrome information, never measured_logical.
         predicted_flip = logical_flip(decoder.decode(detectors))
-        raw_errors += frequency * measured_logical
-        corrected_errors += frequency * (measured_logical ^ predicted_flip)
+        logical_errors += frequency * (measured_logical ^ predicted_flip)
         event_totals += frequency * detectors
+    decoding_seconds = perf_counter() - decoding_started
     summaries.append({
         "cycles": cycles,
-        "raw_errors": raw_errors,
-        "corrected_errors": corrected_errors,
-        "logical_error_raw": raw_errors / SHOTS,
-        "logical_error_corrected": corrected_errors / SHOTS,
+        "logical_errors": logical_errors,
+        "logical_error": logical_errors / SHOTS,
         "detector_rates": event_totals / SHOTS,
+        "sampling_seconds": sampling_seconds,
+        "decoding_seconds": decoding_seconds,
     })
     print(f"QEC cycles={cycles}, shots={SHOTS}: "
-          f"logical_error_raw={raw_errors}/{SHOTS} ({raw_errors / SHOTS:.5f}), "
-          f"logical_error_corrected={corrected_errors}/{SHOTS} "
-          f"({corrected_errors / SHOTS:.5f})")
+          f"logical error={logical_errors}/{SHOTS} ({logical_errors / SHOTS:.5f}), "
+          f"sampling={sampling_seconds:.1f} s, decoding={decoding_seconds:.3f} s")
+experiment_seconds = perf_counter() - experiment_started
+print(f"Sampling and decoding all {len(QEC_CYCLES) * SHOTS} shots: "
+      f"{experiment_seconds:.1f} s ({experiment_seconds / 60:.2f} min)")
 ```
 
 Each cycle count uses 128 independent noisy shots. All occurrences of a
 record are counted using its histogram frequency; distinct records are not
 given equal weight. The simulation requests counts only and does not inspect
-the final statevector. Fixed seeds and explicit serial settings make the
-sampling configuration reproducible. Expect several minutes of CPU time;
-the runtime depends on the machine.
+the final statevector. Up to four workers run independent shots with serial
+kernels. Use `shot_parallelism="serial"` when only one worker is available.
+Fixed seeds reproduce counts for the same runtime, parallelism settings, and
+result requests. The five points require 640 shots in total. The printed wall
+times include circuit setup and sampling separately from decoding, and depend
+on the machine and Numba compilation state.
 
 Every point starts from the same ideal physical-zero state and includes
 noisy QEC cycles and final readout. No shot is postselected on stabilizer
 outcomes or detector activity.
 
-## 7. Plot logical error rate versus QEC cycles
+## 7. Fit logical error per cycle
 
 The Z-check detector map includes a terminal column reconstructed from the
 same noisy data measurements used for logical readout. This terminal column
@@ -706,31 +700,58 @@ history; phase corrections do not change a Z-basis logical readout.
 ```python
 last = summaries[-1]
 rates = last["detector_rates"].T
-figure, axis = plt.subplots(figsize=(7, 4.5))
+figure, axis = plt.subplots(figsize=(11, 4.5))
 maximum = max(0.05, float(rates.max()))
 display = axis.imshow(rates, vmin=0, vmax=maximum, cmap="Blues", aspect="auto")
 axis.set(xticks=range(last["cycles"] + 1),
-         xticklabels=[f"Cycle {t + 1}" for t in range(last["cycles"])] + ["Final data"],
+         xticklabels=[str(t + 1) for t in range(last["cycles"])] + ["Final"],
          yticks=range(4), yticklabels=[f"Z check {q}" for q in Z_CHECKS],
-         xlabel="Detection-event time", title="Z-check detection events")
+         xlabel="QEC cycle / final data readout", title="Z-check detection events")
 for row in range(4):
     for column in range(last["cycles"] + 1):
         value = rates[row, column]
-        axis.text(column, row, f"{value:.3f}", ha="center", va="center",
+        axis.text(column, row, f"{value:.2f}", ha="center", va="center", fontsize=8,
                   color="white" if value > maximum * 0.55 else "black")
 figure.colorbar(display, ax=axis, label="Detection probability")
 figure.tight_layout()
 plt.show()
 ```
 
-The final plot reports the fraction of shots with a wrong logical result
-after R QEC cycles. It is a cumulative error probability for that circuit
-length, not a fitted logical error probability per cycle. Since each shot
-has a binary success/failure outcome, we show pointwise 95% Wilson intervals
-for binomial sampling uncertainty. Zero observed failures still has a
-nonzero upper bound. The intervals do not represent calibration uncertainty.
+The data points are the logical error probabilities after $R$ cycles.
+Assuming independent logical flips with a constant probability $\epsilon_L$
+per cycle, an odd number of flips gives a wrong final result. This yields
+
+$$
+p_L(R;\epsilon_L)=\frac{1-(1-2\epsilon_L)^R}{2},
+\qquad 0\le\epsilon_L\le\tfrac12.
+$$
+
+Fit $\epsilon_L$ by maximizing the binomial likelihood of the five failure
+counts $k_R$ out of $N=128$ shots. Equivalently, minimize
+
+$$
+-\log\mathcal L(\epsilon_L)
+=-\sum_R\left[k_R\log p_L(R;\epsilon_L)
++(N-k_R)\log(1-p_L(R;\epsilon_L))\right],
+$$
+
+where terms independent of $\epsilon_L$ are omitted. Fit the counts directly
+so that zero failures and sampling fluctuations above one half remain valid
+inputs. The error bars are pointwise 95% Wilson intervals for binomial
+sampling uncertainty, including a nonzero upper bound when no failures are
+observed. They are not confidence intervals for the fitted curve.
+
+This one-parameter model fixes $p_L(0)=0$ and assumes identical cycles.
+The simulated experiment also has final-readout errors and finite-history
+decoder effects, so the fitted $\epsilon_L$ is an effective rate over the
+chosen cycle range. It does not separately estimate boundary errors or
+calibration uncertainty.
 
 ```python
+from scipy.optimize import minimize_scalar
+from scipy.special import xlogy, xlog1py
+
+
 def wilson_interval(errors, shots, z=1.959963984540054):
     fraction = errors / shots
     denominator = 1 + z * z / shots
@@ -741,32 +762,68 @@ def wilson_interval(errors, shots, z=1.959963984540054):
     return max(0.0, centre - half), min(1.0, centre + half)
 
 
+def logical_error_model(cycles, epsilon):
+    return 0.5 * (1.0 - (1.0 - 2.0 * epsilon) ** np.asarray(cycles))
+
+
+def fit_logical_error(cycles, failures, shots):
+    """Fit the per-cycle flip probability to independent binomial counts."""
+    cycles = np.asarray(cycles, dtype=float)
+    failures = np.asarray(failures, dtype=float)
+    if (cycles.ndim != 1 or failures.shape != cycles.shape or not cycles.size
+            or not np.all(np.isfinite(cycles)) or not np.all(cycles > 0)
+            or not np.all(cycles == np.floor(cycles))):
+        raise ValueError("cycles and failures must be matching vectors of positive cycles")
+    if (type(shots) is not int or shots <= 0 or not np.all(np.isfinite(failures))
+            or not np.all((failures >= 0) & (failures <= shots))
+            or not np.all(failures == np.floor(failures))):
+        raise ValueError("failures must be integer counts between zero and shots")
+
+    def negative_log_likelihood(epsilon):
+        probabilities = logical_error_model(cycles, epsilon)
+        return float(-np.sum(
+            xlogy(failures, probabilities)
+            + xlog1py(shots - failures, -probabilities)
+        ))
+
+    fit = minimize_scalar(negative_log_likelihood, bounds=(0.0, 0.5),
+                          method="bounded", options={"xatol": 1e-12})
+    if not fit.success:
+        raise RuntimeError(f"Logical-error fit failed: {fit.message}")
+    # The bounded solver excludes endpoints, which can be the optimum.
+    return min((0.0, float(fit.x), 0.5), key=negative_log_likelihood)
+
+
+failures = np.array([summary["logical_errors"] for summary in summaries])
+rates = failures / SHOTS
+epsilon_L = fit_logical_error(QEC_CYCLES, failures, SHOTS)
+print(f"Fitted logical error per cycle: epsilon_L={epsilon_L:.6f} "
+      f"({100 * epsilon_L:.3f}%)")
+intervals = np.array([wilson_interval(count, SHOTS) for count in failures])
+errors = np.maximum(0.0, np.vstack((rates - intervals[:, 0], intervals[:, 1] - rates)))
+fit_cycles = np.linspace(0.0, max(QEC_CYCLES), 301)
+
 figure, axis = plt.subplots(figsize=(8, 4.8))
-for rate_key, count_key, color, marker in (
-    ("logical_error_raw", "raw_errors", "#64748b", "o"),
-    ("logical_error_corrected", "corrected_errors", "#1d4ed8", "s"),
-):
-    rates = np.array([summary[rate_key] for summary in summaries])
-    intervals = np.array([
-        wilson_interval(summary[count_key], SHOTS) for summary in summaries
-    ])
-    errors = np.maximum(0.0, np.vstack((rates - intervals[:, 0], intervals[:, 1] - rates)))
-    axis.errorbar(QEC_CYCLES, rates, yerr=errors, fmt=f"{marker}-",
-                  capsize=4, color=color, label=rate_key)
-axis.set(xticks=QEC_CYCLES, xlabel="QEC cycle", ylabel="Logical error rate",
-         title=f"Surface-code memory-Z ({SHOTS} shots per point)",
-         ylim=(0, None))
-axis.grid(axis="y", alpha=0.25)
-axis.legend()
+axis.errorbar(QEC_CYCLES, rates, yerr=errors, fmt="o", markersize=6,
+              markerfacecolor="white", markeredgewidth=1.5, capsize=4,
+              color="#0072b2", label="Logical error (128 shots per point)")
+axis.plot(fit_cycles, logical_error_model(fit_cycles, epsilon_L),
+          color="#d55e00", linewidth=2.5,
+          label=rf"Fit: $\epsilon_L={epsilon_L:.3e}$ per cycle")
+axis.set(xticks=(0, *QEC_CYCLES), xlabel="QEC cycle", ylabel="Logical error",
+         title="Surface-code memory-Z", xlim=(0, max(QEC_CYCLES) + 0.5),
+         ylim=(0, max(0.52, float(intervals[:, 1].max()) + 0.02)))
+axis.spines[["top", "right"]].set_visible(False)
+axis.grid(axis="y", alpha=0.2)
+axis.legend(loc="upper left")
 figure.tight_layout()
 plt.show()
 ```
 
 A low detection-event rate and a low logical error rate answer different
 questions: readout errors can trigger detectors, and a logical error can
-leave every detector unchanged. Decoding can also misidentify a fault,
-so the corrected rate need not improve for every finite sample. This small
-decoder approximates gate-level and correlated faults with independent
+leave every detector unchanged. Decoding can also misidentify a fault.
+This decoder approximates gate-level and correlated faults with independent
 data-X and ancilla-readout errors.
 
 This memory-Z experiment measures logical Z readout errors. Phase errors
