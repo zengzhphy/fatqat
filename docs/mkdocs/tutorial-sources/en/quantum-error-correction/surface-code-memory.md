@@ -5,7 +5,7 @@ icon: material-shield-check-outline
 figure_alts:
   - "Seventeen-qubit surface-code patch with nine data qubits, four X checks, four Z checks, and the logical Z support"
   - "Z-check detection-event frequencies during fifteen noisy QEC cycles and the final data readout"
-  - "Decoded logical error versus QEC cycles, with 128 shots per point, 95 percent Wilson intervals, and a fitted logical error probability per cycle"
+  - "Decoded logical error versus QEC cycles, with 128 shots per point, symmetric one-standard-error bars, and a fitted logical error probability per cycle"
 ---
 
 # Run a surface-code memory-Z experiment
@@ -593,6 +593,14 @@ bit is not an input to `decode()`. Different final data strings can have
 the same Z-check parities but opposite logical parities; the decoder must
 make the same prediction for such identical syndrome histories.
 
+!!! note "Larger code distances"
+
+    For larger code distances, consider sampling with FatQat, constructing a
+    compatible detector error model with [Stim](https://github.com/quantumlib/Stim),
+    and decoding with [PyMatching](https://github.com/oscarhiggott/PyMatching).
+    The reference model should match the experiment's circuit and measurement
+    protocol.
+
 ## 6. Measure logical error after decoding
 
 Each shot ends with nine reported data bits $b_0,\ldots,b_8$. The measured
@@ -640,7 +648,7 @@ experiment_started = perf_counter()
 for cycles in QEC_CYCLES:
     decoder = SpaceTimeDecoder(cycles)
     sampling_started = perf_counter()
-    seed = int(np.random.SeedSequence([20260912, cycles]).generate_state(1)[0])
+    seed = int(np.random.SeedSequence([20260925, cycles]).generate_state(1)[0])
     result = noisy_backend.run(
         build_memory_z(cycles), shots=SHOTS,
         simulation_config={**RUN_CONFIG, "seed": seed},
@@ -737,9 +745,11 @@ $$
 
 where terms independent of $\epsilon_L$ are omitted. Fit the counts directly
 so that zero failures and sampling fluctuations above one half remain valid
-inputs. The error bars are pointwise 95% Wilson intervals for binomial
-sampling uncertainty, including a nonzero upper bound when no failures are
-observed. They are not confidence intervals for the fitted curve.
+inputs. The symmetric error bars show one estimated binomial standard error,
+$\sigma_R=\sqrt{\hat p_R(1-\hat p_R)/N}$, above and below each measured rate
+$\hat p_R=k_R/N$. These bars describe sampling uncertainty at each point.
+This simple estimate is zero when no failures or only failures are observed,
+even though the true error probability remains uncertain.
 
 This one-parameter model fixes $p_L(0)=0$ and assumes identical cycles.
 The simulated experiment also has final-readout errors and finite-history
@@ -750,16 +760,6 @@ calibration uncertainty.
 ```python
 from scipy.optimize import minimize_scalar
 from scipy.special import xlogy, xlog1py
-
-
-def wilson_interval(errors, shots, z=1.959963984540054):
-    fraction = errors / shots
-    denominator = 1 + z * z / shots
-    centre = (fraction + z * z / (2 * shots)) / denominator
-    half = z * math.sqrt(
-        fraction * (1 - fraction) / shots + z * z / (4 * shots * shots)
-    ) / denominator
-    return max(0.0, centre - half), min(1.0, centre + half)
 
 
 def logical_error_model(cycles, epsilon):
@@ -799,20 +799,19 @@ rates = failures / SHOTS
 epsilon_L = fit_logical_error(QEC_CYCLES, failures, SHOTS)
 print(f"Fitted logical error per cycle: epsilon_L={epsilon_L:.6f} "
       f"({100 * epsilon_L:.3f}%)")
-intervals = np.array([wilson_interval(count, SHOTS) for count in failures])
-errors = np.maximum(0.0, np.vstack((rates - intervals[:, 0], intervals[:, 1] - rates)))
+standard_errors = np.sqrt(rates * (1 - rates) / SHOTS)
 fit_cycles = np.linspace(0.0, max(QEC_CYCLES), 301)
 
 figure, axis = plt.subplots(figsize=(8, 4.8))
-axis.errorbar(QEC_CYCLES, rates, yerr=errors, fmt="o", markersize=6,
+axis.errorbar(QEC_CYCLES, rates, yerr=standard_errors, fmt="o", markersize=6,
               markerfacecolor="white", markeredgewidth=1.5, capsize=4,
-              color="#0072b2", label="Logical error (128 shots per point)")
+              color="#0072b2", label="Logical error (128 shots per point, ±1 SE)")
 axis.plot(fit_cycles, logical_error_model(fit_cycles, epsilon_L),
           color="#d55e00", linewidth=2.5,
           label=rf"Fit: $\epsilon_L={epsilon_L:.3e}$ per cycle")
 axis.set(xticks=(0, *QEC_CYCLES), xlabel="QEC cycle", ylabel="Logical error",
          title="Surface-code memory-Z", xlim=(0, max(QEC_CYCLES) + 0.5),
-         ylim=(0, max(0.52, float(intervals[:, 1].max()) + 0.02)))
+         ylim=(0, max(0.52, float((rates + standard_errors).max()) + 0.02)))
 axis.spines[["top", "right"]].set_visible(False)
 axis.grid(axis="y", alpha=0.2)
 axis.legend(loc="upper left")
