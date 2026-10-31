@@ -1,21 +1,26 @@
-"""Offline PR revision, approval gating and GPU status tests."""
+"""Offline PR pinning, source transfer boundaries, workflow and status tests."""
 
+import base64
 import copy
 import importlib.util
 import io
 import json
 from pathlib import Path
 import re
+import subprocess
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "gpu_pr", Path(__file__).resolve().parents[1] / ".github/scripts/gpu_pr.py"
+    "gpu_pr", ROOT / ".github/scripts/gpu_pr.py"
 )
 gpu_pr = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gpu_pr)
 SHA, TRUSTED, BASE, MERGE = (character * 40 for character in "abcd")
+REQUIRED = "configure select sdk pending power ssh identity source upload current tests stop cleanup".split()
 
 
 @pytest.fixture(name="case")
@@ -44,7 +49,9 @@ def controller_case(tmp_path, monkeypatch):
         "GITHUB_EVENT_PATH": str(tmp_path / "event.json"),
         "GITHUB_OUTPUT": str(tmp_path / "output"),
         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        "RUNNER_TEMP": str(tmp_path),
         "GH_TOKEN": "job-token",
+        "RUN_CANCELLED": "false",
     }
     calls, waits = [], []
     protection = {
@@ -55,6 +62,7 @@ def controller_case(tmp_path, monkeypatch):
             }
         ]
     }
+    manual_protection = {"protection_rules": []}
 
     def request(_api, path, payload=None):
         calls.append((path, payload))
@@ -62,6 +70,8 @@ def controller_case(tmp_path, monkeypatch):
             return {}
         if path == "/environments/gpu-ci":
             return copy.deepcopy(protection)
+        if path == "/environments/gpu-ci-manual":
+            return copy.deepcopy(manual_protection)
         if path == f"/git/commits/{pr['merge_commit_sha']}":
             return copy.deepcopy(merge)
         if path == "/pulls/42":
@@ -71,7 +81,7 @@ def controller_case(tmp_path, monkeypatch):
     monkeypatch.setattr(gpu_pr.GitHub, "request", request)
     monkeypatch.setattr(gpu_pr, "sleep", waits.append)
 
-    def invoke(action="select"):
+    def invoke(action="prepare"):
         Path(env["GITHUB_EVENT_PATH"]).write_text(json.dumps(event), encoding="utf-8")
         return gpu_pr.main([action], env)
 
@@ -83,6 +93,7 @@ def controller_case(tmp_path, monkeypatch):
         "calls": calls,
         "waits": waits,
         "protection": protection,
+        "manual_protection": manual_protection,
         "invoke": invoke,
     }
 
@@ -108,267 +119,208 @@ def test_selects_current_pr_from_event_head_not_control_sha(case, action):
         "head_sha": SHA,
         "base_sha": BASE,
         "merge_sha": MERGE,
-        "ready": "true",
     }
 
 
+def test_merge_base_comes_from_tested_commit_not_pr_api(case):
+    case["pr"]["base"]["sha"] = TRUSTED
+    assert case["invoke"]() == 0
+    assert outputs(case)["base_sha"] == BASE
+    assert case["invoke"]("recheck") == 0
+
+
+def test_unexpected_prepare_error_preserves_traceback(case, monkeypatch, capsys):
+    def broken(_api, _event):
+        raise TypeError("unexpected metadata shape")
+
+    monkeypatch.setattr(gpu_pr, "select_pr", broken)
+    assert case["invoke"]() == 1
+    error = capsys.readouterr().err
+    assert "Traceback" in error
+    assert "TypeError: unexpected metadata shape" in error
+    assert "job-token" not in error
+
+
+def test_unexpected_exception_redacts_credentials_in_its_message(
+    case, monkeypatch, capsys
+):
+    def broken(_api, _event):
+        raise RuntimeError(f"unexpected error with {case['env']['GH_TOKEN']}")
+
+    monkeypatch.setattr(gpu_pr, "select_pr", broken)
+    assert case["invoke"]() == 1
+    error = capsys.readouterr().err
+    assert "Traceback" in error and "<redacted>" in error
+    assert "job-token" not in error
+
+
 @pytest.mark.parametrize("title", ["docs: update README", "fix: core simulator"])
-def test_all_prs_prepare_approval_without_cpu_or_file_queries(case, title):
-    # PR events do not contain a file list; preparation must not request one.
+def test_all_prs_selected_without_cpu_file_or_runner_queries(case, title):
     case["event"]["pull_request"]["title"] = title
-    assert case["invoke"]("prepare") == 0
-    assert outputs(case)["mode"] == "pr"
-    assert outputs(case)["ready"] == "true"
+    assert case["invoke"]() == 0
     assert case["calls"] == [
         ("/pulls/42", None),
         (f"/git/commits/{MERGE}", None),
         ("/environments/gpu-ci", None),
     ]
     summary = Path(case["env"]["GITHUB_STEP_SUMMARY"]).read_text(encoding="utf-8")
-    assert "PR #42" in summary and "gpu-ci" in summary
+    assert "after gpu-ci approval" in summary
     assert all(sha in summary for sha in (SHA, BASE, MERGE))
 
 
 @pytest.mark.parametrize(
     "path", ["/pulls/42", f"/git/commits/{MERGE}", "/environments/gpu-ci"]
 )
-def test_api_failure_blocks_approval(case, monkeypatch, path):
+def test_api_failure_blocks_start(case, monkeypatch, path):
     request = gpu_pr.GitHub.request
 
     def fail(api, endpoint, payload=None):
         if endpoint == path:
-            raise gpu_pr.APIError("Unavailable")
+            raise gpu_pr.APIError("HTTP 403")
         return request(api, endpoint, payload)
 
     monkeypatch.setattr(gpu_pr.GitHub, "request", fail)
-    assert case["invoke"]("prepare") == 1
+    assert case["invoke"]() == 1
     assert outputs(case) == {}
 
 
 @pytest.mark.parametrize(
     "rules",
-    [[], [{"type": "required_reviewers", "reviewers": []}], [{"type": "wait_timer"}]],
+    [
+        None,
+        {},
+        [None],
+        [{}],
+        [],
+        [{"type": "required_reviewers", "reviewers": []}],
+        [{"type": "required_reviewers", "reviewers": {"id": 1}}],
+        [{"type": "required_reviewers", "reviewers": [None]}],
+        [{"type": "wait_timer"}],
+    ],
 )
-def test_missing_required_reviewers_cannot_request_approval(case, rules, capsys):
+def test_invalid_environment_protection_fails_explicitly(case, rules, capsys):
     case["protection"]["protection_rules"] = rules
-    assert case["invoke"]("prepare") == 1
+    assert case["invoke"]() == 1
     assert outputs(case) == {}
-    assert "Required reviewers" in capsys.readouterr().err
+    assert "Environment" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("changed", [None, "head", "base", "merge", "closed"])
-def test_post_approval_recheck_keeps_the_prepared_revision(case, changed):
-    assert case["invoke"]("prepare") == 0
-    prepared = outputs(case)
-    Path(case["env"]["GITHUB_OUTPUT"]).unlink()
-    case["env"].update(
-        EXPECTED_PR=prepared["pr_number"],
-        EXPECTED_HEAD_SHA=prepared["head_sha"],
-        EXPECTED_BASE_SHA=prepared["base_sha"],
-        EXPECTED_MERGE_SHA=prepared["merge_sha"],
-    )
+def test_missing_environment_fields_fail_explicitly(case, capsys):
+    case["protection"].clear()
+    assert case["invoke"]() == 1
+    assert "protection_rules" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "changed", [None, "head", "base", "merge", "closed", "protection"]
+)
+def test_recheck_keeps_pinned_revision_and_approval_rules(case, changed):
+    assert case["invoke"]() == 0
     if changed in {"head", "base"}:
-        case["pr"][changed]["sha"] = "e" * 40
         case["merge"]["parents"][changed == "head"]["sha"] = "e" * 40
+        case["pr"][changed]["sha"] = "e" * 40
     elif changed == "merge":
         case["pr"]["merge_commit_sha"] = case["merge"]["sha"] = "e" * 40
     elif changed == "closed":
         case["pr"]["state"] = "closed"
-    assert case["invoke"]() == 0
-    assert (outputs(case).get("ready") == "true") == (changed is None)
+    elif changed == "protection":
+        case["protection"]["protection_rules"] = []
+    assert case["invoke"]("recheck") == (0 if changed is None else 1)
 
 
-def test_environment_protection_is_rechecked_before_power(case):
-    case["env"].update(
-        EXPECTED_PR="42",
-        EXPECTED_HEAD_SHA=SHA,
-        EXPECTED_BASE_SHA=BASE,
-        EXPECTED_MERGE_SHA=MERGE,
-    )
-    case["protection"]["protection_rules"] = []
+@pytest.mark.parametrize(
+    "change",
+    [
+        "number",
+        "event_number",
+        "base_repository",
+        "closed",
+        "new_head",
+        "conflict",
+        "activity",
+    ],
+)
+def test_wrong_or_outdated_pr_never_selected(case, change):
+    target, key, value = {
+        "number": (case["pr"], "number", 43),
+        "event_number": (case["event"], "number", 43),
+        "base_repository": (case["pr"]["base"]["repo"], "full_name", "other/fatqat"),
+        "closed": (case["pr"], "state", "closed"),
+        "new_head": (case["pr"]["head"], "sha", TRUSTED),
+        "activity": (case["event"], "action", "edited"),
+        "conflict": (case["pr"], "mergeable", False),
+    }[change]
+    target[key] = value
     assert case["invoke"]() == 1
     assert outputs(case) == {}
 
 
-def test_unsupported_pr_activity_is_skipped(case):
-    case["event"]["action"] = "edited"
-    assert case["invoke"]() == 0
-    assert outputs(case) == {}
-    assert not case["calls"]
-
-
-@pytest.mark.parametrize("change", ["number", "base_repository"])
-def test_wrong_pr_identity_is_never_selected(case, change):
-    if change == "number":
-        case["pr"]["number"] = 43
-    else:
-        case["pr"]["base"]["repo"]["full_name"] = "other/fatqat"
-    assert case["invoke"]() == 0
-    assert outputs(case) == {}
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("EXPECTED_PR", "43"),
-        ("EXPECTED_HEAD_SHA", "e" * 40),
-        ("EXPECTED_BASE_SHA", "e" * 40),
-        ("EXPECTED_MERGE_SHA", "e" * 40),
-    ],
-)
-def test_recheck_after_gpu_start_rejects_changed_selection(case, field, value):
-    case["env"].update(
-        EXPECTED_PR="42",
-        EXPECTED_HEAD_SHA=SHA,
-        EXPECTED_BASE_SHA=BASE,
-        EXPECTED_MERGE_SHA=MERGE,
-    )
-    expected = case["env"][field]
-    case["env"][field] = value
-    assert case["invoke"]() == 0
-    assert outputs(case) == {}
-    case["env"][field] = expected
-    assert case["invoke"]() == 0
-    assert outputs(case)["ready"] == "true"
-
-
-def test_conflicting_merge_cannot_start_gpu(case):
-    case["pr"]["mergeable"] = False
-    assert case["invoke"]("prepare") == 0
-    assert outputs(case) == {}
-    assert case["calls"] == [("/pulls/42", None)]
-    assert not case["waits"]
-
-
-def test_unknown_mergeability_retries_then_prepares_approval(case, monkeypatch):
-    case["pr"]["mergeable"] = None
-
-    def resolve(seconds):
-        case["waits"].append(seconds)
-        case["pr"]["mergeable"] = True
-
-    monkeypatch.setattr(gpu_pr, "sleep", resolve)
-    assert case["invoke"]("prepare") == 0
-    assert outputs(case)["ready"] == "true"
-    assert outputs(case)["merge_sha"] == MERGE
-    assert case["waits"] == [2]
-    assert case["calls"] == [
-        ("/pulls/42", None),
-        ("/pulls/42", None),
-        (f"/git/commits/{MERGE}", None),
-        ("/environments/gpu-ci", None),
-    ]
-
-
-def test_persistently_unknown_mergeability_fails_with_rerun_hint(case, capsys):
-    case["pr"]["mergeable"] = None
-    assert case["invoke"]("prepare") == 1
-    assert outputs(case) == {}
-    assert case["calls"] == [("/pulls/42", None)] * 5
-    assert case["waits"] == [2] * 4
-    assert "unknown after 5 queries; rerun the GPU workflow" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("changed", ["closed", "head"])
-def test_mergeability_retry_rechecks_open_state_and_event_head(
-    case, monkeypatch, changed
+@pytest.mark.parametrize("resolve", [True, False, "head", "closed"])
+def test_unknown_mergeability_has_bounded_retry_and_rechecks_identity(
+    case, monkeypatch, resolve
 ):
     case["pr"]["mergeable"] = None
 
-    def change_pr(seconds):
+    def wait(seconds):
         case["waits"].append(seconds)
-        if changed == "closed":
+        if resolve is True:
+            case["pr"]["mergeable"] = True
+        elif resolve == "head":
+            case["pr"]["head"]["sha"] = TRUSTED
+        elif resolve == "closed":
             case["pr"]["state"] = "closed"
-        else:
-            case["pr"]["head"]["sha"] = "e" * 40
 
-    monkeypatch.setattr(gpu_pr, "sleep", change_pr)
-    assert case["invoke"]("prepare") == 0
-    assert outputs(case) == {}
-    assert case["calls"] == [("/pulls/42", None)] * 2
-    assert case["waits"] == [2]
+    monkeypatch.setattr(gpu_pr, "sleep", wait)
+    assert case["invoke"]() == (0 if resolve is True else 1)
+    assert case["waits"] == [2] * (4 if resolve is False else 1)
 
 
-@pytest.mark.parametrize("field", ["base", "merge_commit_sha"])
-@pytest.mark.parametrize("value", [None, "short", MERGE + ";echo unsafe"])
-def test_missing_or_invalid_merge_revision_cannot_start_gpu(case, field, value):
-    if field == "base":
-        case["pr"][field]["sha"] = value
+@pytest.mark.parametrize("value", [None, "a" * 7, SHA + ";echo unsafe", SHA + "\n"])
+@pytest.mark.parametrize("field", ["head", "merge"])
+def test_malformed_sha_never_becomes_output(case, field, value):
+    if field == "head":
+        case["event"]["pull_request"]["head"]["sha"] = value
     else:
-        case["pr"][field] = value
-    assert case["invoke"]() == 0
+        case["pr"]["merge_commit_sha"] = value
+    assert case["invoke"]() == 1
     assert outputs(case) == {}
 
 
 @pytest.mark.parametrize(
     "parents",
-    [[], [BASE], [SHA, BASE], [BASE, TRUSTED], [TRUSTED, SHA], [BASE, SHA, TRUSTED]],
+    [[], [BASE], [SHA, BASE], [BASE, TRUSTED], [BASE, SHA, TRUSTED], ["bad", SHA]],
 )
-def test_merge_must_have_exact_selected_base_and_head_parents(case, parents):
+def test_merge_requires_exactly_two_valid_parents_with_event_head_second(case, parents):
     case["merge"]["parents"] = [{"sha": sha} for sha in parents]
-    assert case["invoke"]() == 0
+    assert case["invoke"]() == 1
     assert outputs(case) == {}
 
 
-def test_merge_api_must_return_the_requested_commit(case):
+def test_merge_api_must_return_requested_commit(case):
     case["merge"]["sha"] = TRUSTED
-    assert case["invoke"]() == 0
+    assert case["invoke"]() == 1
     assert outputs(case) == {}
 
 
-def test_selection_log_records_fixed_revision(case, capsys):
-    assert case["invoke"]() == 0
-    message = capsys.readouterr().out
-    assert "PR #42" in message
-    assert all(sha in message for sha in (SHA, BASE, MERGE))
-
-
-def test_stale_recheck_skips_tests_and_reports_error_on_original_head(case):
-    case["env"].update(
-        EXPECTED_PR="42",
-        EXPECTED_HEAD_SHA=SHA,
-        EXPECTED_BASE_SHA=BASE,
-        EXPECTED_MERGE_SHA=MERGE,
-    )
-    case["pr"]["head"]["sha"] = "e" * 40
-    assert case["invoke"]() == 0
-    assert outputs(case) == {}
-    case["env"].update(
-        PR_HEAD_SHA=SHA,
-        START_RESULT="success",
-        GPU_JOB_RESULT="success",
-        TEST_RESULT="skipped",
-        STOP_RESULT="success",
-    )
-    assert case["invoke"]("report") == 0
-    path, payload = case["calls"][-1]
-    assert path == f"/statuses/{SHA}"
-    assert payload["state"] == "error"
-
-
-@pytest.mark.parametrize("action", ["prepare", "select"])
-def test_manual_default_branch_needs_no_pr_or_api_queries(case, action):
+def test_manual_pins_default_branch_event_commit_and_uses_manual_environment(case):
     case["env"]["GITHUB_EVENT_NAME"] = "workflow_dispatch"
-    assert case["invoke"](action) == 0
-    assert outputs(case) == {
-        "mode": "manual",
-        "ready": "true",
-    }
-    assert not case["calls"]
+    assert case["invoke"]() == 0
+    assert outputs(case) == {"mode": "manual", "merge_sha": TRUSTED}
+    assert case["calls"] == [("/environments/gpu-ci-manual", None)]
+    case["manual_protection"].update(case["protection"])
+    assert case["invoke"]("recheck") == 1
 
 
 @pytest.mark.parametrize(
     "field,value", [("GITHUB_REF", "refs/heads/feature"), ("GITHUB_EVENT_NAME", "push")]
 )
-def test_non_default_branch_and_other_events_are_skipped(case, field, value):
+def test_non_default_branch_and_other_events_fail(case, field, value):
     case["env"][field] = value
-    assert case["invoke"]() == 0
+    assert case["invoke"]() == 1
     assert not case["calls"]
-    assert outputs(case) == {}
 
 
-def test_pending_links_to_gpu_run_on_exact_pr_commit(case):
-    case["env"]["PR_HEAD_SHA"] = SHA
+def test_pending_links_to_event_head(case):
     assert case["invoke"]("pending") == 0
     path, payload = case["calls"][0]
     assert path == f"/statuses/{SHA}"
@@ -376,187 +328,171 @@ def test_pending_links_to_gpu_run_on_exact_pr_commit(case):
     assert payload["target_url"] == "https://github.com/upstream/fatqat/actions/runs/99"
 
 
+@pytest.mark.parametrize("step", REQUIRED)
 @pytest.mark.parametrize(
-    "start,gpu_job,test,stop,state",
-    [
-        ("success", "success", "success", "success", "success"),
-        ("success", "failure", "failure", "success", "failure"),
-        ("success", "success", "failure", "success", "failure"),
-        ("failure", "skipped", "skipped", "success", "error"),
-        ("success", "success", "skipped", "success", "error"),
-        ("success", "failure", "skipped", "success", "error"),
-        ("success", "failure", "success", "success", "error"),
-        ("success", "cancelled", "success", "success", "error"),
-        ("success", "cancelled", "failure", "success", "error"),
-        ("success", "cancelled", "cancelled", "success", "error"),
-        ("success", "success", "success", "failure", "error"),
-        ("success", "failure", "failure", "failure", "error"),
-        ("success", "success", None, "success", "error"),
-    ],
+    "outcome", ["success", "failure", "skipped", "cancelled", None]
 )
-def test_status_requires_job_and_test_success(case, start, gpu_job, test, stop, state):
-    case["env"].update(
-        PR_HEAD_SHA=SHA,
-        START_RESULT=start,
-        GPU_JOB_RESULT=gpu_job,
-        TEST_RESULT=test,
-        STOP_RESULT=stop,
-    )
+def test_report_requires_every_required_step_and_uses_event_head(case, step, outcome):
+    outcomes = {name: {"outcome": "success"} for name in REQUIRED}
+    outcomes[step] = {"outcome": outcome}
+    case["env"]["STEP_RESULTS"] = json.dumps(outcomes)
+    case["pr"]["head"]["sha"] = TRUSTED
     assert case["invoke"]("report") == 0
-    path, payload = case["calls"][0]
+    path, payload = case["calls"][-1]
     assert path == f"/statuses/{SHA}"
-    assert payload["state"] == state
+    expected = (
+        "success"
+        if outcome == "success"
+        else "failure" if step == "tests" and outcome == "failure" else "error"
+    )
+    assert payload["state"] == expected
 
 
-def workflow_job(name):
-    text = (
-        Path(__file__).resolve().parents[1] / ".github/workflows/gpu.yml"
-    ).read_text(encoding="utf-8")
-    return re.search(rf"^  {name}:\n(.*?)(?=^  [\w-]+:|\Z)", text, re.M | re.S)[1]
+@pytest.mark.parametrize("test_outcome", ["success", "failure", "skipped"])
+def test_cancelled_run_reports_error_even_if_steps_succeeded(case, test_outcome):
+    outcomes = {name: {"outcome": "success"} for name in REQUIRED}
+    outcomes["tests"]["outcome"] = test_outcome
+    case["env"].update(RUN_CANCELLED="true", STEP_RESULTS=json.dumps(outcomes))
+    assert case["invoke"]("report") == 0
+    path, payload = case["calls"][-1]
+    assert path == f"/statuses/{SHA}"
+    assert payload["state"] == "error"
 
 
-def test_workflow_cleanup_covers_start_and_gpu_failures_only_after_attempt():
-    start, stop = workflow_job("start-gpu"), workflow_job("stop-gpu")
-    # Check the actual job condition: no success() or GPU result can suppress cleanup
-    # after start failure, install/preflight/test failure, or GPU job timeout.
-    assert "needs: [start-gpu, gpu-tests]" in stop
-    condition = re.search(r"^    if: (.+)$", stop, re.M)[1]
-    assert condition == "${{ always() && needs.start-gpu.outputs.attempted == 'true' }}"
-    # Ineligible selections emit no ready output, so neither start nor stop can run.
-    power = start.split("      - name: Start instance and wait for runner\n", 1)[1]
-    assert "if: steps.select.outputs.ready == 'true'" in power
+@pytest.mark.parametrize(
+    "change",
+    [None, "revision", "parents", "api_head", "git_failure", "git_timeout", "manual"],
+)
+def test_archive_fetches_only_pinned_source_without_executing_it(
+    case, monkeypatch, change
+):
+    if change == "manual":
+        case["env"]["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+    assert case["invoke"]() == 0
+    commands = []
+
+    def git(command, **kwargs):
+        commands.append((command, dict(kwargs["env"])))
+        assert kwargs["capture_output"] and kwargs["timeout"] == 300
+        operation = command[3]
+        if operation == "fetch":
+            if change == "git_failure":
+                raise subprocess.CalledProcessError(1, command, stderr="secret")
+            if change == "git_timeout":
+                raise subprocess.TimeoutExpired(command, 300)
+            if change == "api_head":
+                case["pr"]["head"]["sha"] = TRUSTED
+        output = ""
+        if operation == "rev-parse":
+            output = TRUSTED if change in {"revision", "manual"} else MERGE
+        elif operation == "show":
+            output = f"{BASE} {TRUSTED if change == 'parents' else SHA}"
+        return SimpleNamespace(stdout=output)
+
+    monkeypatch.setattr(gpu_pr.subprocess, "run", git)
+    assert case["invoke"]("archive") == (0 if change in {None, "manual"} else 1)
+    fetch, fetch_env = next(item for item in commands if item[0][3] == "fetch")
+    assert fetch[-1] == (TRUSTED if change == "manual" else "refs/pull/42/merge")
+    assert "--bare" in commands[0][0] and "--template=" in commands[0][0]
+    assert all(
+        not {"checkout", "pip", "pytest"}.intersection(command)
+        for command, _ in commands
+    )
+    assert all("job-token" not in str(command) for command, _ in commands)
+    assert all("GH_TOKEN" not in env for _, env in commands)
+    assert (
+        base64.b64decode(fetch_env["GIT_CONFIG_VALUE_0"].split()[-1])
+        == b"x-access-token:job-token"
+    )
+    assert all(
+        "GIT_CONFIG_VALUE_0" not in env
+        for command, env in commands
+        if command[3] != "fetch"
+    )
+
+
+def workflow():
+    return (ROOT / ".github/workflows/gpu.yml").read_text(encoding="utf-8-sig")
+
+
+def test_workflow_has_one_hosted_job_and_environment_selected_before_all_steps():
+    text = workflow()
+    assert re.findall(r"^  ([\w-]+):$", text.split("jobs:\n")[1], re.M) == ["gpu"]
+    assert "runs-on: ubuntu-latest" in text
+    assert (
+        "name: ${{ github.event_name == 'pull_request_target' && 'gpu-ci' || 'gpu-ci-manual' }}"
+        in text
+    )
+    assert text.count("github.event.pull_request.head.sha || github.sha") == 2
+    assert text.count("format('PR #{0}', github.event.number)") == 2
+    assert (
+        "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+        in text
+    )
+    assert "types: [opened, synchronize, reopened]" in text
+    assert "workflow_dispatch:" in text
+    assert "group: fatqat-hai-gpu\n  cancel-in-progress: false\n  queue: max" in text
+    for forbidden in (
+        "self-hosted",
+        "GH_RUNNER_READ_TOKEN",
+        "HAI_RUNNER_NAME",
+        "needs:",
+        "paths:",
+        "workflow_run:",
+        "continue-on-error",
+        "allow-unsafe-pr-checkout",
+    ):
+        assert forbidden not in text
+    hai = (ROOT / ".github/scripts/hai_power.py").read_text()
+    assert "/actions/runners" not in hai and "GH_RUNNER_READ_TOKEN" not in hai
+
+
+def test_workflow_orders_shutdown_and_reporting_after_every_failure():
+    text = workflow()
+    step_ids = re.findall(r"^        id: (\w+)$", text, re.M)
+    assert step_ids == ["control", *REQUIRED]
     assert (
         'echo "attempted=true" >> "$GITHUB_OUTPUT"\n          python -u .github/scripts/hai_power.py start'
-        in power
+        in text
     )
-    assert "environment:" not in stop
-
-
-def test_workflow_requests_environment_approval_for_every_pr():
-    prepare, approve = workflow_job("prepare"), workflow_job("approve")
-    text = (
-        Path(__file__).resolve().parents[1] / ".github/workflows/gpu.yml"
-    ).read_text(encoding="utf-8")
-    triggers = text.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
-    assert (
-        triggers.strip()
-        == "workflow_dispatch:\n  pull_request_target:\n    types: [opened, synchronize, reopened]"
-    )
-    assert "gpu_pr.py prepare" in prepare
-    assert "secrets." not in prepare
-    assert "pip install" not in prepare
-    assert "environment:" not in prepare
-    assert re.search(r"^    if: (.+)$", approve, re.M)[1] == (
-        "needs.prepare.outputs.mode == 'pr'"
-    )
-    assert "needs: prepare" in approve
-    assert "environment:\n      name: gpu-ci" in approve
-    assert "permissions: {}" in approve
-    assert "hai_power.py" not in approve
-    assert "secrets." not in approve
-
-
-def test_workflow_cannot_start_pr_without_successful_gpu_approval():
-    start = workflow_job("start-gpu")
-    condition = re.search(r"^    if: >-\n(.*?)(?=^    \w)", start, re.M | re.S)[1]
-    assert " ".join(condition.split()) == (
-        "always() && !cancelled() && needs.prepare.result == 'success' && "
-        "needs.prepare.outputs.ready == 'true' && "
-        "(needs.prepare.outputs.mode == 'manual' || "
-        "(needs.prepare.outputs.mode == 'pr' && "
-        "needs.approve.result == 'success'))"
-    )
-    assert "needs: [prepare, approve]" in start
-    for field in ("head_sha", "base_sha", "merge_sha"):
-        assert (
-            f"EXPECTED_{field.upper()}: ${{{{ needs.prepare.outputs.{field} }}}}"
-            in start
+    assert "if: ${{ always() && steps.power.outputs.attempted == 'true' }}" in text
+    remote_cleanup = text[
+        text.index("      - name: Clean remote workspace") : text.index(
+            "      - name: Stop HAI"
         )
-    assert "EXPECTED_PR: ${{ needs.prepare.outputs.pr_number }}" in start
-    assert start.index("gpu_pr.py select") < start.index("hai_power.py start")
-    report = workflow_job("report")
-    assert re.search(r"^    if: (.+)$", report, re.M)[1] == (
-        "${{ always() && needs.prepare.outputs.mode == 'pr' }}"
-    )
-
-
-@pytest.mark.parametrize(
-    "start_result,ready,cancelled,expected",
-    [
-        pytest.param("success", "true", False, True, id="manual-approve-skipped"),
-        ("failure", "true", False, False),
-        ("skipped", "true", False, False),
-        ("cancelled", "true", False, False),
-        ("success", "false", False, False),
-        ("success", "", False, False),
-        ("success", "true", True, False),
-    ],
-)
-def test_gpu_job_explicitly_requires_successful_ready_start(
-    start_result, ready, cancelled, expected
-):
-    gpu = workflow_job("gpu-tests")
-    condition = re.search(r"^    if: (.+)$", gpu, re.M)[1]
-    assert condition == (
-        "${{ !cancelled() && needs.start-gpu.result == 'success' && "
-        "needs.start-gpu.outputs.ready == 'true' }}"
-    )
-    # A skipped manual approval must not block a successful start's GPU job.
-    # PR approval remains enforced by the start-gpu gate checked above.
-    assert "needs: start-gpu" in gpu
-    # Evaluate only these predicates locally, not GitHub's scheduler.
-    predicates = {
-        "!cancelled()": not cancelled,
-        "needs.start-gpu.result == 'success'": start_result == "success",
-        "needs.start-gpu.outputs.ready == 'true'": ready == "true",
-    }
-    assert all(predicates[part] for part in condition[4:-3].split(" && ")) == expected
-
-
-def test_workflow_reports_job_result_separately_from_pytest_outcome():
-    gpu, report = workflow_job("gpu-tests"), workflow_job("report")
-    assert "test_result: ${{ steps.tests.outcome }}" in gpu
-    for key, expression in {
-        "PR_HEAD_SHA": "needs.prepare.outputs.head_sha",
-        "START_RESULT": "needs.start-gpu.result",
-        "GPU_JOB_RESULT": "needs.gpu-tests.result",
-        "TEST_RESULT": "needs.gpu-tests.outputs.test_result",
-        "STOP_RESULT": "needs.stop-gpu.result",
-    }.items():
-        assert f"{key}: ${{{{ {expression} }}}}" in report
-
-
-def test_unsafe_checkout_is_only_for_pinned_pr_merge_and_verification_precedes_install():
-    gpu = workflow_job("gpu-tests")
-    trusted, pr_checkout = gpu.split(
-        "      - name: Check out selected PR merge commit\n"
-    )
-    assert "allow-unsafe-pr-checkout" not in trusted
-    assert "ref: ${{ needs.start-gpu.outputs.merge_sha }}" in pr_checkout
-    assert "fetch-depth: 2" in pr_checkout
-    assert "allow-unsafe-pr-checkout: true" in pr_checkout
-    assert "persist-credentials: false" in pr_checkout
-    verification = pr_checkout.split("          export PATH=", 1)[0]
-    assert 'test "$(git rev-parse HEAD)" = "$MERGE_SHA"' in verification
+    ]
     assert (
-        'test "$(git show -s --format=%P HEAD)" = "$BASE_SHA $PR_HEAD_SHA"'
-        in verification
+        "if: ${{ always() && (steps.upload.outcome == 'failure' || steps.current.outcome == 'failure') }}"
+        in remote_cleanup
     )
-    assert "pip install" not in verification
-    assert "secrets." not in gpu
-    assert ": write" not in gpu
-    for name in ("prepare", "start-gpu", "stop-gpu", "report"):
-        control = workflow_job(name)
-        assert "runs-on: ubuntu-latest" in control
-        assert "ref: ${{ github.sha }}" in control
-        assert "allow-unsafe-pr-checkout" not in control
+    assert "gpu_ssh.py cleanup" in remote_cleanup
+    stop = text[text.index("      - name: Stop HAI") :]
+    assert "hai_power.py stop" in stop
+    assert "STEP_RESULTS: ${{ toJSON(steps) }}" in stop
+    assert "RUN_CANCELLED: ${{ cancelled() }}" in stop
+    assert stop.index("id: cleanup") < stop.index("gpu_pr.py report")
+    assert "always() && github.event_name == 'pull_request_target'" in stop
+    assert (
+        "if: always()" in stop
+        and 'rm -f -- "$RUNNER_TEMP/fatqat-gpu-ssh/id_ed25519"' in stop
+    )
+    budgets = [
+        int(value)
+        for value in re.findall(r"^        timeout-minutes: (\d+)$", text, re.M)
+    ]
+    assert sum(budgets) < int(re.search(r"^    timeout-minutes: (\d+)$", text, re.M)[1])
 
 
-@pytest.mark.parametrize("value", ["a" * 7, SHA + ";echo unsafe", SHA + "\n"])
-def test_malformed_sha_never_becomes_output(case, value):
-    case["event"]["pull_request"]["head"]["sha"] = value
-    assert case["invoke"]() == 0
-    assert outputs(case) == {}
+def test_workflow_only_executes_trusted_control_locally():
+    text = workflow()
+    assert text.count("uses: actions/checkout") == 1
+    assert (
+        "ref: ${{ github.sha }}\n          path: control\n          persist-credentials: false"
+        in text
+    )
+    assert "working-directory: control" in text
+    assert "run: python -u .github/scripts/gpu_pr.py recheck" in text
+    assert "pytest tests/" not in text and "pip install . " not in text
 
 
 @pytest.mark.parametrize(
@@ -567,35 +503,36 @@ def test_malformed_sha_never_becomes_output(case, value):
         HTTPError("url", 403, "secret", {}, None),
     ],
 )
-def test_transport_failure_redacts_details_and_uses_job_token(monkeypatch, error):
+def test_transport_errors_log_method_path_without_credentials(
+    monkeypatch, error, capsys
+):
     def fail(_opener, request, timeout):
         assert request.get_header("Authorization") == "Bearer job-token"
         assert timeout == 20
         raise error
 
     monkeypatch.setattr(
-        gpu_pr, "build_opener", lambda *_args: type("Opener", (), {"open": fail})()
+        gpu_pr, "build_opener", lambda *_: type("Opener", (), {"open": fail})()
     )
     api = gpu_pr.GitHub(
         {"GITHUB_REPOSITORY": "upstream/fatqat", "GH_TOKEN": "job-token"}
     )
     with pytest.raises(gpu_pr.APIError) as caught:
         api.request("/pulls/42")
-    assert "secret" not in str(caught.value)
+    output = capsys.readouterr().out + str(caught.value)
+    assert "GET /repos/upstream/fatqat/pulls/42" in output
+    assert "secret" not in output and "job-token" not in output
 
 
-def test_transport_reads_metadata_and_posts_status_with_job_token(monkeypatch):
-    class Response(io.BytesIO):
-        pass
-
+def test_transport_reads_metadata_posts_status_and_rejects_redirects(monkeypatch):
     requests = []
 
     def respond(_opener, request, timeout):
         requests.append(request)
-        return Response(b'{"number": 42}' if request.data is None else b"{}")
+        return io.BytesIO(b'{"number": 42}' if request.data is None else b"{}")
 
     monkeypatch.setattr(
-        gpu_pr, "build_opener", lambda *_args: type("Opener", (), {"open": respond})()
+        gpu_pr, "build_opener", lambda *_: type("Opener", (), {"open": respond})()
     )
     api = gpu_pr.GitHub(
         {
